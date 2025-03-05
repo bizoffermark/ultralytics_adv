@@ -138,7 +138,6 @@ class Model(torch.nn.Module):
             self.model_name = self.model = model
             self.overrides["task"] = task or "detect"  # set `task=detect` if not explicitly set
             return
-
         # Load or create new YOLO model
         __import__("os").environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # to avoid deterministic warnings
         if Path(model).suffix in {".yaml", ".yml"}:
@@ -251,18 +250,32 @@ class Model(torch.nn.Module):
             >>> model._new("yolo11n.yaml", task="detect", verbose=True)
         """
         cfg_dict = yaml_model_load(cfg)
+        
+    
         self.cfg = cfg
         self.task = task or guess_model_task(cfg_dict)
-        self.model = (model or self._smart_load("model"))(cfg_dict, verbose=verbose and RANK == -1)  # build model
-        self.overrides["model"] = self.cfg
-        self.overrides["task"] = self.task
+        if 'grad' in cfg_dict.keys():
+            if cfg_dict['grad']:
+                self._load(cfg_dict['model'],
+                           cfg=cfg_dict)
+            self.model.args = {**self.overrides, **DEFAULT_CFG_DICT}  # combine default and model args (prefer model args)
 
-        # Below added to allow export from YAMLs
-        self.model.args = {**DEFAULT_CFG_DICT, **self.overrides}  # combine default and model args (prefer model args)
-        self.model.task = self.task
+        else:
+            self.model = (model or self._smart_load("model"))(cfg_dict, verbose=verbose and RANK == -1)  # build model
+            self.overrides["model"] = self.cfg
+            self.overrides["task"] = self.task
+
+            # Below added to allow export from YAMLs
+            self.model.args = {**DEFAULT_CFG_DICT, **self.overrides}  # combine default and model args (prefer model args)
+            self.model.task = self.task
+            
         self.model_name = cfg
+        breakpoint()
 
-    def _load(self, weights: str, task=None) -> None:
+    def _load(self, 
+              weights: str, 
+              task=None,
+              cfg: dict=None) -> None:
         """
         Loads a model from a checkpoint file or initializes it from a weights file.
 
@@ -546,7 +559,7 @@ class Model(torch.nn.Module):
         custom = {"conf": 0.25, "batch": 1, "save": is_cli, "mode": "predict"}  # method defaults
         args = {**self.overrides, **custom, **kwargs}  # highest priority args on the right
         prompts = args.pop("prompts", None)  # for SAM-type models
-
+        
         if not self.predictor:
             self.predictor = (predictor or self._smart_load("predictor"))(overrides=args, _callbacks=self.callbacks)
             self.predictor.setup_model(model=self.model, verbose=is_cli)
@@ -814,6 +827,74 @@ class Model(torch.nn.Module):
             self.overrides = self.model.args
             self.metrics = getattr(self.trainer.validator, "metrics", None)  # TODO: no metrics returned by DDP
         return self.metrics
+
+    def load_attack(
+        self,
+        trainer=None,
+        **kwargs: Any,
+    ):
+        """
+        Trains the model using the specified dataset and training configuration.
+
+        This method facilitates model training with a range of customizable settings. It supports training with a
+        custom trainer or the default training approach. The method handles scenarios such as resuming training
+        from a checkpoint, integrating with Ultralytics HUB, and updating model and configuration after training.
+
+        When using Ultralytics HUB, if the session has a loaded model, the method prioritizes HUB training
+        arguments and warns if local arguments are provided. It checks for pip updates and combines default
+        configurations, method-specific defaults, and user-provided arguments to configure the training process.
+
+        Args:
+            trainer (BaseTrainer | None): Custom trainer instance for model training. If None, uses default.
+            **kwargs: Arbitrary keyword arguments for training configuration. Common options include:
+                data (str): Path to dataset configuration file.
+                epochs (int): Number of training epochs.
+                batch_size (int): Batch size for training.
+                imgsz (int): Input image size.
+                device (str): Device to run training on (e.g., 'cuda', 'cpu').
+                workers (int): Number of worker threads for data loading.
+                optimizer (str): Optimizer to use for training.
+                lr0 (float): Initial learning rate.
+                patience (int): Epochs to wait for no observable improvement for early stopping of training.
+
+        Returns:
+            (Dict | None): Training metrics if available and training is successful; otherwise, None.
+
+        Raises:
+            AssertionError: If the model is not a PyTorch model.
+            PermissionError: If there is a permission issue with the HUB session.
+            ModuleNotFoundError: If the HUB SDK is not installed.
+
+        Examples:
+            >>> model = YOLO("yolo11n.pt")
+            >>> results = model.train(data="coco8.yaml", epochs=3)
+        """
+        self._check_is_pytorch_model()
+        if hasattr(self.session, "model") and self.session.model.id:  # Ultralytics HUB session with loaded model
+            if any(kwargs):
+                LOGGER.warning("WARNING ⚠️ using HUB training arguments, ignoring local training arguments.")
+            kwargs = self.session.train_args  # overwrite kwargs
+
+        checks.check_pip_update_available()
+        overrides = yaml_load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
+        
+        custom = {
+            # NOTE: handle the case when 'cfg' includes 'data'.
+            "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
+            "model": self.overrides["model"],
+            "task": self.task,
+        }  # method defaults
+        args = {**overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
+        if args.get("resume"):
+            args["resume"] = self.ckpt_path
+
+        self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
+        
+        self.trainer._setup_train(world_size=1)
+        
+        # if not args.get("resume"):  # manually set model only if not resuming
+        #     self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
+        self.model = self.trainer.model
 
     def tune(
         self,

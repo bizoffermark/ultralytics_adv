@@ -54,9 +54,20 @@ class DetectionTrainer(BaseTrainer):
         workers = self.args.workers if mode == "train" else self.args.workers * 2
         return build_dataloader(dataset, batch_size, workers, shuffle, rank)  # return dataloader
 
-    def preprocess_batch(self, batch):
+    def preprocess_batch(self, 
+                         batch,
+                         patch=None,
+                         apply_patch: callable=None,
+                         **kwargs):
         """Preprocesses a batch of images by scaling and converting to float."""
+
         batch["img"] = batch["img"].to(self.device, non_blocking=True).float() / 255
+        
+        print(f"fdsaf")
+        if apply_patch is not None:
+            # apply patch on the image AFTER the standardization
+            batch['img'] = apply_patch(batch['img'], patch, **kwargs) 
+
         if self.args.multi_scale:
             imgs = batch["img"]
             sz = (
