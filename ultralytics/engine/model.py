@@ -888,6 +888,7 @@ class Model(torch.nn.Module):
         if args.get("resume"):
             args["resume"] = self.ckpt_path
 
+        breakpoint()
         self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
         
         self.trainer._setup_train(world_size=1)
